@@ -100,7 +100,7 @@ pub fn build(b: *Build) !void {
     mod_sokol.linkLibrary(lib_sokol);
 
     // examples build step
-    try buildExamples(b, .{
+    const examples_step = try buildExamples(b, .{
         .target = target,
         .optimize = optimize,
         .backend = sokol_backend,
@@ -108,7 +108,10 @@ pub fn build(b: *Build) !void {
         .emsdk = emsdk,
     });
     // a manually invoked build step to build auto-docs
-    buildDocs(b, target);
+    const serve_exe = buildServerExecutable(b, optimize);
+
+    buildDocs(b, serve_exe, target);
+    buildExamplesWebServer(b, serve_exe, examples_step);
 }
 
 // helper function to resolve .auto backend based on target platform
@@ -497,8 +500,46 @@ fn emSdkSetupStep(b: *Build, emsdk: *Build.Dependency) !?*Build.Step.Run {
     }
 }
 
+//== WEB SERVER =====================================================================================================
+fn buildServerExecutable(b: *Build, optimize: OptimizeMode) *Build.Step.Compile {
+    const hosttarget = b.graph.host;
+
+    const serve_exe = b.addExecutable(.{
+        .name = "serve",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/httpserver/serve.zig"),
+            .target = hosttarget,
+            .optimize = optimize,
+        }),
+    });
+
+    const mod_server = b.addModule("StaticHttpFileServer", .{
+        .root_source_file = b.path("tools/httpserver/root.zig"),
+        .target = hosttarget,
+        .optimize = optimize,
+    });
+
+    mod_server.addImport("mime", b.dependency("mime", .{
+        .target = hosttarget,
+        .optimize = optimize,
+    }).module("mime"));
+
+    serve_exe.root_module.addImport("StaticHttpFileServer", mod_server);
+
+    return serve_exe;
+}
+
+fn buildExamplesWebServer(b: *Build, serve_exe: *Build.Step.Compile, examples_step: *Build.Step) void {
+    const run_serve_exe = b.addRunArtifact(serve_exe);
+    run_serve_exe.addArgs(&.{ "zig-out/web", "-p", "8000" });
+
+    const serve_step = b.step("serve-wasm", "Serve wasm examples");
+    serve_step.dependOn(&run_serve_exe.step);
+    serve_step.dependOn(examples_step);
+}
+
 //== DOCUMENTATION =====================================================================================================
-fn buildDocs(b: *Build, target: Build.ResolvedTarget) void {
+fn buildDocs(b: *Build, serve_exe: *Build.Step.Compile, target: Build.ResolvedTarget) void {
     const lib = b.addLibrary(.{
         .name = "sokol",
         .root_module = b.createModule(.{
@@ -534,6 +575,13 @@ fn buildDocs(b: *Build, target: Build.ResolvedTarget) void {
 
     const doc_step = b.step("docs", "Build documentation");
     doc_step.dependOn(&overwrite_sources_tar.step);
+
+    const run_serve_docs_exe = b.addRunArtifact(serve_exe);
+    run_serve_docs_exe.addArgs(&.{ "zig-out/docs", "-p", "8081" });
+
+    const serve_docs_step = b.step("serve-docs", "Serve docs");
+    serve_docs_step.dependOn(&run_serve_docs_exe.step);
+    serve_docs_step.dependOn(doc_step);
 }
 
 //=== EXAMPLES =========================================================================================================
@@ -552,12 +600,28 @@ const ExampleOptions = struct {
 };
 
 // build all examples
-fn buildExamples(b: *Build, options: ExampleOptions) !void {
+fn buildExamples(b: *Build, options: ExampleOptions) !*Build.Step {
     // a top level build step for all examples
     const examples_step = b.step("examples", "Build all examples");
     inline for (examples) |example| {
         try buildExample(b, example, examples_step, options);
     }
+
+    if (isPlatform(options.target.result, .web)) {
+        var buf: [256 * examples.len]u8 = undefined;
+        var str_writer = std.Io.Writer.fixed(&buf);
+
+        _ = try str_writer.print("<html><h1>Examples</h1><body><ul>", .{});
+        inline for (examples) |example| {
+            _ = try str_writer.print("<li><a href=\"{s}.html\">{s}</a></li>\n", .{ example.name, example.name });
+        }
+        _ = try str_writer.print("</ul></body></html>", .{});
+
+        const wf = b.addWriteFile("index.html", str_writer.buffered());
+        const index = b.addInstallFile(wf.getDirectory().path(b, "index.html"), "web/index.html");
+        examples_step.dependOn(&index.step);
+    }
+    return examples_step;
 }
 
 // build one of the examples
